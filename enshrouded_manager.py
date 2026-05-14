@@ -5,7 +5,8 @@ import re
 import sys
 import json
 import html
-import fcntl
+if sys.platform != "win32":
+    import fcntl
 import struct
 import shutil
 import subprocess
@@ -51,7 +52,6 @@ def _load_install_config() -> dict:
 
 _cfg           = _load_install_config()
 _install_dir   = Path(_cfg["install_dir"])
-GE_PROTON_DIR  = Path(_cfg["ge_proton_dir"])
 
 SERVER_DIR     = _install_dir / "server"
 SAVE_DIR       = _install_dir / "saves"
@@ -59,9 +59,16 @@ WORLDS_DIR     = SAVE_DIR / "worlds"
 NICKNAMES_FILE = WORLDS_DIR / "nicknames.json"
 CONFIG_FILE    = SERVER_DIR / "enshrouded_server.json"
 SERVER_BIN     = SERVER_DIR / "enshrouded_server.exe"
-WINE64_BIN     = GE_PROTON_DIR / "files" / "bin" / "wine64"
-WINE_PREFIX    = SERVER_DIR / "wine_prefix"
 LOG_DIR        = SAVE_DIR / "logs"
+
+if sys.platform == "win32":
+    GE_PROTON_DIR = None
+    WINE64_BIN    = None
+    WINE_PREFIX   = None
+else:
+    GE_PROTON_DIR = Path(_cfg["ge_proton_dir"])
+    WINE64_BIN    = GE_PROTON_DIR / "files" / "bin" / "wine64"
+    WINE_PREFIX   = SERVER_DIR / "wine_prefix"
 
 NS_PER_MIN      = 60_000_000_000
 MACHINE_RE      = re.compile(
@@ -476,7 +483,10 @@ class WorldsWidget(QWidget):
 
     def _import_world(self):
         # Start browser in Steam cloud save dir if it exists
-        steam_remote = Path.home() / ".local/share/Steam/userdata"
+        if sys.platform == "win32":
+            steam_remote = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Steam" / "userdata"
+        else:
+            steam_remote = Path.home() / ".local/share/Steam/userdata"
         start_dir = str(Path.home())
         for user_dir in (steam_remote.iterdir() if steam_remote.exists() else []):
             remote = user_dir / "1203620" / "remote"
@@ -1232,20 +1242,25 @@ class MainWindow(QMainWindow):
         if not SERVER_BIN.exists():
             QMessageBox.critical(self, "Error", f"Server binary not found:\n{SERVER_BIN}")
             return
-        if not WINE64_BIN.exists():
+        if sys.platform != "win32" and not WINE64_BIN.exists():
             QMessageBox.critical(self, "Error", f"Wine not found:\n{WINE64_BIN}")
             return
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        # Kill any orphaned enshrouded_server.exe processes from prior sessions.
-        subprocess.run(["pkill", "-KILL", "-f", "enshrouded_server.exe"], capture_output=True)
-        # Kill only our prefix's wineserver (not system-wide, to avoid disrupting other apps).
-        wineserver_bin = GE_PROTON_DIR / "files" / "bin" / "wineserver"
-        if wineserver_bin.exists():
-            subprocess.run(
-                [str(wineserver_bin), "-k9"],
-                env={**os.environ, "WINEPREFIX": str(WINE_PREFIX)},
-                capture_output=True, timeout=5,
-            )
+        # Kill any orphaned server processes from prior sessions.
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/IM", "enshrouded_server.exe"],
+                           capture_output=True)
+        else:
+            subprocess.run(["pkill", "-KILL", "-f", "enshrouded_server.exe"],
+                           capture_output=True)
+            # Kill only our prefix's wineserver (not system-wide).
+            wineserver_bin = GE_PROTON_DIR / "files" / "bin" / "wineserver"
+            if wineserver_bin.exists():
+                subprocess.run(
+                    [str(wineserver_bin), "-k9"],
+                    env={**os.environ, "WINEPREFIX": str(WINE_PREFIX)},
+                    capture_output=True, timeout=5,
+                )
         self._log.append_info(f"Starting server — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         # Wait for ports to clear without blocking the event loop, then launch.
         self._port_wait_attempts = 0
@@ -1255,9 +1270,16 @@ class MainWindow(QMainWindow):
         self._port_wait_timer.start()
 
     def _wait_for_port_then_start(self):
-        r = subprocess.run(["ss", "-ulnp"], capture_output=True, text=True)
+        import socket
+        ports_clear = True
+        for port in (15636, 15637):
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                try:
+                    s.bind(("", port))
+                except OSError:
+                    ports_clear = False
+                    break
         self._port_wait_attempts += 1
-        ports_clear = "15637" not in r.stdout and "15636" not in r.stdout
         if ports_clear or self._port_wait_attempts >= 8:
             self._port_wait_timer.stop()
             self._port_wait_timer.deleteLater()
@@ -1265,30 +1287,37 @@ class MainWindow(QMainWindow):
 
     def _do_start_server(self):
         env = QProcessEnvironment.systemEnvironment()
-        env.insert("HOME", os.environ.get("HOME", str(Path.home())))
-        env.insert("WINEPREFIX", str(WINE_PREFIX))
-        wine_lib = str(GE_PROTON_DIR / "files" / "lib")
-        existing_ld = env.value("LD_LIBRARY_PATH", "")
-        env.insert("LD_LIBRARY_PATH", f"{wine_lib}:{existing_ld}" if existing_ld else wine_lib)
         env.insert("SteamAppId", "1203620")
         env.insert("SteamGameId", "1203620")
-        env.insert("WINEDLLOVERRIDES", "wineconsole=d")
-        env.insert("WINEDEBUG", "-all")
-        env.insert("XDG_RUNTIME_DIR", os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+        if sys.platform != "win32":
+            env.insert("HOME", os.environ.get("HOME", str(Path.home())))
+            env.insert("WINEPREFIX", str(WINE_PREFIX))
+            wine_lib = str(GE_PROTON_DIR / "files" / "lib")
+            existing_ld = env.value("LD_LIBRARY_PATH", "")
+            env.insert("LD_LIBRARY_PATH", f"{wine_lib}:{existing_ld}" if existing_ld else wine_lib)
+            env.insert("WINEDLLOVERRIDES", "wineconsole=d")
+            env.insert("WINEDEBUG", "-all")
+            env.insert("XDG_RUNTIME_DIR", os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
         self._process.setProcessEnvironment(env)
         self._process.setWorkingDirectory(str(SERVER_DIR))
         self._apply_resource_group()
-        self._process.start(str(WINE64_BIN), [str(SERVER_BIN)])
+        if sys.platform == "win32":
+            self._process.start(str(SERVER_BIN), [])
+        else:
+            self._process.start(str(WINE64_BIN), [str(SERVER_BIN)])
 
     def stop_server(self):
-        import signal as _signal
         self._log.append_info("Stopping server…")
         pid = self._process.processId()
         if pid > 0:
-            try:
-                os.kill(pid, _signal.SIGINT)
-            except ProcessLookupError:
-                pass
+            if sys.platform == "win32":
+                self._process.terminate()
+            else:
+                import signal as _signal
+                try:
+                    os.kill(pid, _signal.SIGINT)
+                except ProcessLookupError:
+                    pass
         self._force_kill_timer.start(FORCE_KILL_SECS * 1000)
 
     def _force_kill(self):
@@ -1672,7 +1701,10 @@ class MainWindow(QMainWindow):
             if self._overlay:
                 self._overlay.set_status("World generated. Stopping server to migrate save files…")
             self._log.append_info("First-run: world generated, stopping server to migrate paths…")
-            os.kill(self._process.processId(), __import__("signal").SIGINT)
+            if sys.platform == "win32":
+                self._process.terminate()
+            else:
+                os.kill(self._process.processId(), __import__("signal").SIGINT)
             QTimer.singleShot(15_000, self._force_kill)
         else:
             # Server already stopped — migrate inline now
@@ -1723,13 +1755,22 @@ class MainWindow(QMainWindow):
         """Release the single-instance lock and relaunch this script."""
         global _lock_fh
         if _lock_fh:
-            fcntl.flock(_lock_fh, fcntl.LOCK_UN)
+            if sys.platform == "win32":
+                import msvcrt
+                try:
+                    _lock_fh.seek(0)
+                    msvcrt.locking(_lock_fh.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                fcntl.flock(_lock_fh, fcntl.LOCK_UN)
             _lock_fh.close()
             _lock_fh = None
         (Path(__file__).parent / "manager.pid").unlink(missing_ok=True)
-        launch = Path(__file__).parent / "launch.sh"
+        launcher = "launch.bat" if sys.platform == "win32" else "launch.sh"
+        launch = Path(__file__).parent / launcher
         if launch.exists():
-            subprocess.Popen([str(launch)])
+            subprocess.Popen([str(launch)], shell=(sys.platform == "win32"))
         else:
             subprocess.Popen([sys.executable, str(Path(__file__).resolve())])
         QApplication.quit()
@@ -1795,7 +1836,12 @@ def main():
     global _lock_fh
     _lock_fh = open(Path(__file__).parent / "manager.lock", "w")
     try:
-        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if sys.platform == "win32":
+            import msvcrt
+            _lock_fh.seek(0)
+            msvcrt.locking(_lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         # Write PID so the installer (and other scripts) can kill us by PID.
         _pid_file = Path(__file__).parent / "manager.pid"
         _pid_file.write_text(str(os.getpid()))
@@ -1805,8 +1851,9 @@ def main():
         sys.exit(0)
 
     import signal as _signal
-    _signal.signal(_signal.SIGINT,  _signal.SIG_IGN)
-    _signal.signal(_signal.SIGTERM, _signal.SIG_IGN)
+    _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
+    if sys.platform != "win32":
+        _signal.signal(_signal.SIGTERM, _signal.SIG_IGN)
 
     window = MainWindow()
 
