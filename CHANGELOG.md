@@ -1,6 +1,7 @@
 # Changelog
 
-## [Unreleased]
+## [2.1.0] - 2026-05-14
+- Cross-platform Windows support: server now runs natively on Windows (no Wine/GE-Proton needed)
 - SteamCMD is now kept after installation (useful for manual server updates)
 
 ## [2.0.0] - 2026-05-09
