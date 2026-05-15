@@ -79,6 +79,13 @@ STOP_COUNTDOWN_SECS = 5   # visible countdown before sending stop signal
 FORCE_KILL_SECS     = 30  # grace period before force-killing if server won't stop
 SETTINGS_FILE   = Path(__file__).parent / "manager_settings.json"
 
+# First-run strategy. True = fast: stop the server as soon as its config file
+# exists, point the config at an empty world_1, and let the server generate the
+# world on the next start (~20-30s first run). False = legacy: wait ~5 min for
+# the autosave and migrate the generated world. Flip to False if the fast path
+# misbehaves.
+FIRST_RUN_FAST = True
+
 # ---------------------------------------------------------------------------
 # Theme — dark-navy palette shared with the installer (src/install_tk.py)
 # ---------------------------------------------------------------------------
@@ -1380,6 +1387,11 @@ class MainWindow(QMainWindow):
         self._migration_timer.setInterval(10_000)
         self._migration_timer.timeout.connect(self._check_first_run_migration)
 
+        # Fast first-run: short poll for the server's config file (see FIRST_RUN_FAST).
+        self._fast_first_run_timer = QTimer(self)
+        self._fast_first_run_timer.setInterval(1_500)
+        self._fast_first_run_timer.timeout.connect(self._check_fast_first_run)
+
         self._overlay: FirstRunOverlay | None = None
 
         tabs = QTabWidget()
@@ -1616,17 +1628,25 @@ class MainWindow(QMainWindow):
         self._log_tail_pos = server_log.stat().st_size if server_log.exists() else 0
         self._log_tail_timer.start()
         if self._overlay and _needs_first_run_migration():
-            self._overlay.set_status(
-                "The server is generating your world for the first time.\n"
-                "This can take several minutes — please wait…"
-            )
-            self._migration_timer.start()
-            self._check_first_run_migration()  # immediate check in case files exist from a prior run
+            if FIRST_RUN_FAST:
+                self._overlay.set_status(
+                    "Setting up your server for the first time…\nThis only takes a moment."
+                )
+                self._fast_first_run_timer.start()
+                self._check_fast_first_run()  # config file may already exist
+            else:
+                self._overlay.set_status(
+                    "The server is generating your world for the first time.\n"
+                    "This can take several minutes — please wait…"
+                )
+                self._migration_timer.start()
+                self._check_first_run_migration()  # immediate check in case files exist from a prior run
 
     def _on_server_stopped(self):
         self._log_tail_timer.stop()
         self._force_kill_timer.stop()
         self._migration_timer.stop()
+        self._fast_first_run_timer.stop()
         self._resource_tab.restart_snapshot_btn.setEnabled(False)
         self._tail_server_log()
         code = self._process.exitCode()
@@ -1938,31 +1958,64 @@ class MainWindow(QMainWindow):
             if self._overlay:
                 self._overlay.set_status("World generated. Stopping server to migrate save files…")
             self._log.append_info("First-run: world generated, stopping server to migrate paths…")
-            pid = self._process.processId()
-            if sys.platform == "win32":
-                if pid <= 0 or not _send_ctrl_c_windows(pid):
-                    self._process.terminate()
-            else:
-                os.kill(pid, __import__("signal").SIGINT)
-            QTimer.singleShot(15_000, self._force_kill)
+            self._graceful_stop_first_run()
         else:
             # Server already stopped — migrate inline now
             self._finish_first_run_setup()
         return True
 
+    def _graceful_stop_first_run(self):
+        """Gracefully stop the server during first-run; migration runs on stop."""
+        pid = self._process.processId()
+        if sys.platform == "win32":
+            if pid <= 0 or not _send_ctrl_c_windows(pid):
+                self._process.terminate()
+        else:
+            os.kill(pid, __import__("signal").SIGINT)
+        QTimer.singleShot(15_000, self._force_kill)
+
+    def _check_fast_first_run(self):
+        """Fast first-run: as soon as the server has written its config file, stop
+        it and migrate paths — no waiting for the world's first autosave."""
+        if not CONFIG_FILE.exists():
+            return  # config not written yet — keep polling
+        self._fast_first_run_timer.stop()
+        if self._migration_pending:
+            return
+        self._migration_pending = True
+        if self._overlay:
+            self._overlay.set_status("Finishing setup…")
+        self._log.append_info("First-run (fast): server config created, finishing setup…")
+        # Brief settle so the server finishes writing its config defaults, then stop.
+        QTimer.singleShot(5_000, self._stop_for_fast_first_run)
+
+    def _stop_for_fast_first_run(self):
+        if not self._migration_pending:
+            return  # server already stopped on its own; _on_server_stopped handled it
+        if self._is_running():
+            self._graceful_stop_first_run()  # migration runs in _on_server_stopped
+        else:
+            self._migration_pending = False
+            self._finish_first_run_setup()
+
     def _finish_first_run_setup(self):
-        """Run the save migration, then wait for the user to confirm the restart."""
-        self._log.append_info("First-run setup: migrating save files…")
+        """Finalise first-run config, then wait for the user to confirm the restart."""
+        self._log.append_info("First-run setup: migrating the generated world…")
         self._do_first_run_migration()
-        self._log.append_info("Migration complete. Waiting for user to confirm restart.")
+        self._log.append_info("Setup complete. Waiting for user to confirm restart.")
         if self._overlay:
             self._overlay.setup_finished(
-                "Setup is complete — your world has been migrated into the manager.\n\n"
-                "The manager needs to restart to load it. Click below when you're ready."
+                "First-time setup is complete.\n\n"
+                "The manager needs to restart to apply it — click below when you're ready."
             )
 
     def _do_first_run_migration(self):
-        """Move server-generated saves/logs into managed paths and update config."""
+        """Move server-generated saves/logs into managed paths and update config.
+
+        The graceful Ctrl+C stop flushes the world to disk on shutdown, so by the
+        time this runs the first-run world exists and is moved into world_1 — both
+        the fast and legacy paths preserve the world the server generated.
+        """
         if not CONFIG_FILE.exists():
             return
         data = json.loads(CONFIG_FILE.read_text())
