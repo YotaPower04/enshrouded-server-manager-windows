@@ -24,7 +24,7 @@ For the Linux version (which runs the Windows server binary through GE-Proton), 
 
 ## Installation
 
-Download `Install ESM.exe` from the [Releases page](https://github.com/YotaPower04/enshrouded-server-manager-windows/releases) and run it. The GUI installer will:
+Download `Install.ESM.exe` from the [Releases page](https://github.com/YotaPower04/enshrouded-server-manager-windows/releases) and run it. The GUI installer will:
 
 1. Verify (and install if missing) Python 3.12 and VC++ Redistributable 2022 x64
 2. Download SteamCMD and the Enshrouded dedicated server
