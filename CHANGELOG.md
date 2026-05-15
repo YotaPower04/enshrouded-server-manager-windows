@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.2.1] - 2026-05-15
+- Dark-navy theme applied app-wide, matching the installer's palette (all tabs, inputs, lists, menus)
+- Fast first-run setup: instead of waiting ~5 minutes for the server's first periodic autosave, the manager stops the server gracefully once its config file exists — the server flushes the generated world on shutdown — cutting first run to ~20–30s (gated by `FIRST_RUN_FAST`)
+- Reworked the first-run overlay: a loading indicator during setup, with a *Restart Manager* confirmation button shown only once setup is complete
+- Fixed the taskbar showing the Python icon — the manager now sets an explicit Windows AppUserModelID
+- Fixed unreadable text on the Worlds tab (inactive list selection) and input fields that blended into the background
+- Renamed the distributable from `Install.exe` to `Install ESM.exe`
+
 ## [2.2.0] - 2026-05-15
 - Replaced the console installer (`install.py` / `install.bat`) with a Tkinter GUI installer (`install_tk.py`), shipped as `Install.exe`
 - Fixed first-run save migration: clicking *Complete Setup Now* before the server's first periodic save no longer leaves `saves/worlds/world_1/` empty; the manager now waits for the save and migration auto-fires
