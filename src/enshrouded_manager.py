@@ -75,12 +75,38 @@ MACHINE_RE      = re.compile(
     r'm#(\d+)\(\d+\): up \d+ \(\d+\), down \d+ \(\d+\), '
     r'remote \d+ \(\d+\), limit \d+, lost \d+, ping (\d+) ms, (\w+)'
 )
-FORCE_KILL_SECS = 15
+STOP_COUNTDOWN_SECS = 5   # visible countdown before sending stop signal
+FORCE_KILL_SECS     = 30  # grace period before force-killing if server won't stop
 SETTINGS_FILE   = Path(__file__).parent / "manager_settings.json"
 
 # ---------------------------------------------------------------------------
 # PE subsystem patch — suppress Wine console window for headless server
 # ---------------------------------------------------------------------------
+
+# Send Ctrl+C to a console-subsystem child process. taskkill without /F sends
+# WM_CLOSE, which a console app with no top-level window ignores — so the server
+# would be hard-killed by the force-kill timer before it could flush its save.
+# This uses AttachConsole + GenerateConsoleCtrlEvent, the documented way to
+# signal a console app from a GUI parent (pythonw.exe).
+def _send_ctrl_c_windows(pid: int) -> bool:
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    import time
+    kernel32 = ctypes.windll.kernel32
+    CTRL_C_EVENT = 0
+    kernel32.FreeConsole()
+    if not kernel32.AttachConsole(pid):
+        return False
+    try:
+        kernel32.SetConsoleCtrlHandler(None, True)
+        ok = bool(kernel32.GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0))
+        time.sleep(0.1)
+    finally:
+        kernel32.FreeConsole()
+        kernel32.SetConsoleCtrlHandler(None, False)
+    return ok
+
 
 def patch_pe_to_gui(exe: Path) -> bool:
     """Patch a Windows PE executable's subsystem from CONSOLE (3) to WINDOWS (2)."""
@@ -215,6 +241,7 @@ class FirstRunOverlay(QWidget):
     """Full-window overlay shown during first-run setup. Blocks all tab interaction."""
     skip_requested     = pyqtSignal()
     complete_requested = pyqtSignal()
+    open_log_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget):
         super().__init__(parent)
@@ -253,7 +280,18 @@ class FirstRunOverlay(QWidget):
             "QPushButton:hover { background:#888; }"
         )
         self._skip_btn.clicked.connect(self.skip_requested)
+
+        self._log_btn = QPushButton("Open Log in Notepad")
+        self._log_btn.setVisible(False)
+        self._log_btn.setMinimumHeight(36)
+        self._log_btn.setStyleSheet(
+            "QPushButton { background:#2980b9; color:white; border-radius:4px; padding:6px 12px; }"
+            "QPushButton:hover { background:#3498db; }"
+        )
+        self._log_btn.clicked.connect(self.open_log_requested)
+
         btn_row.addWidget(self._complete_btn)
+        btn_row.addWidget(self._log_btn)
         btn_row.addWidget(self._skip_btn)
         btn_row.addStretch()
 
@@ -273,9 +311,13 @@ class FirstRunOverlay(QWidget):
     def show_skip_button(self):
         self._skip_btn.setVisible(True)
 
+    def show_log_button(self):
+        self._log_btn.setVisible(True)
+
     def hide_buttons(self):
         self._complete_btn.setVisible(False)
         self._skip_btn.setVisible(False)
+        self._log_btn.setVisible(False)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -288,6 +330,9 @@ class FirstRunOverlay(QWidget):
 # ---------------------------------------------------------------------------
 
 def make_icon(running: bool) -> QIcon:
+    _ico = Path(__file__).parent / ("running.ico" if running else "manager.ico")
+    if _ico.exists():
+        return QIcon(str(_ico))
     px = QPixmap(64, 64)
     px.fill(Qt.GlobalColor.transparent)
     p = QPainter(px)
@@ -520,7 +565,12 @@ class WorldsWidget(QWidget):
                 f"Could not find {hash_name}-index alongside the selected file.")
             return
 
-        index_data = json.loads(index_file.read_text())
+        try:
+            index_data = json.loads(index_file.read_text(encoding="utf-8", errors="replace"))
+        except (json.JSONDecodeError, OSError) as e:
+            QMessageBox.warning(self, "Invalid Index File",
+                f"Could not read the save index file:\n{index_file.name}\n\n{e}")
+            return
 
         nick, ok = QInputDialog.getText(self, "Import World", "World nickname:")
         if not ok or not nick.strip():
@@ -539,21 +589,65 @@ class WorldsWidget(QWidget):
         # The dedicated server always uses its own fixed save hash (e.g. 3ad85aea)
         # regardless of the source file's hash. Detect it from an existing world.
         server_hash = None
-        for wd in WORLDS_DIR.iterdir():
-            if not wd.is_dir():
-                continue
-            for f in wd.iterdir():
-                if f.name.endswith("-index") and f.is_file():
-                    server_hash = f.name[:-len("-index")]
-                    break
-            if server_hash:
-                break
+
+        def _find_hash_in(directory: Path) -> str | None:
+            try:
+                for f in directory.iterdir():
+                    if f.name.endswith("-index") and f.is_file():
+                        return f.name[:-len("-index")]
+            except OSError:
+                pass
+            return None
+
+        # Pass 1: check CONFIG_FILE's saveDirectory (resolve relative paths against SERVER_DIR).
+        if CONFIG_FILE.exists():
+            try:
+                _cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8", errors="replace"))
+                _sd_raw = _cfg.get("saveDirectory", "")
+                if _sd_raw:
+                    _sd = Path(_sd_raw)
+                    if not _sd.is_absolute():
+                        _sd = (SERVER_DIR / _sd).resolve()
+                    for _search in [_sd, _sd / "savegame"]:
+                        server_hash = _find_hash_in(_search)
+                        if server_hash:
+                            break
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Pass 2: recursively scan all managed world dirs.
+        if not server_hash and WORLDS_DIR.exists():
+            try:
+                for wd in WORLDS_DIR.iterdir():
+                    if wd == world_dir or not wd.is_dir():
+                        continue
+                    for f in wd.rglob("*-index"):
+                        if f.is_file():
+                            server_hash = f.name[:-len("-index")]
+                            break
+                    if server_hash:
+                        break
+            except OSError:
+                pass
+
+        # Pass 3: scan SERVER_DIR subdirs (catches pre-migration saves or alternate paths).
+        if not server_hash:
+            try:
+                for sub in SERVER_DIR.iterdir():
+                    if not sub.is_dir():
+                        continue
+                    server_hash = _find_hash_in(sub)
+                    if server_hash:
+                        break
+            except OSError:
+                pass
 
         if not server_hash:
             QMessageBox.warning(self, "Cannot Import",
-                "Could not determine the server's save hash.\n"
-                "Start the server on any world once first, then retry.")
-            shutil.rmtree(str(world_dir))
+                "Could not determine the server's save hash.\n\n"
+                "The server must have run at least once so it can create its save files.\n"
+                "Start the server, let it run for 30 seconds, then retry the import.")
+            shutil.rmtree(str(world_dir), ignore_errors=True)
             return
 
         latest = index_data.get("latest", 0)
@@ -1145,6 +1239,7 @@ class MainWindow(QMainWindow):
         self._process.finished.connect(self._on_server_stopped)
 
         self._log_tail_pos = 0
+        self._active_log_path = LOG_DIR / "enshrouded_server.log"
         self._log_tail_timer = QTimer(self)
         self._log_tail_timer.setInterval(500)
         self._log_tail_timer.timeout.connect(self._tail_server_log)
@@ -1224,6 +1319,7 @@ class MainWindow(QMainWindow):
             self._overlay = FirstRunOverlay(self)
             self._overlay.skip_requested.connect(self._dismiss_overlay)
             self._overlay.complete_requested.connect(self._complete_first_run_setup)
+            self._overlay.open_log_requested.connect(self._open_first_run_log)
             self._overlay.setGeometry(0, 0, self.width(), self.height())
             self._overlay.show()
             self._overlay.raise_()
@@ -1248,8 +1344,10 @@ class MainWindow(QMainWindow):
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         # Kill any orphaned server processes from prior sessions.
         if sys.platform == "win32":
+            # stdin=DEVNULL: pythonw.exe has a NULL stdin handle and capture_output
+            # would otherwise trip _winapi.DuplicateHandle with WinError 6.
             subprocess.run(["taskkill", "/F", "/IM", "enshrouded_server.exe"],
-                           capture_output=True)
+                           capture_output=True, stdin=subprocess.DEVNULL)
         else:
             subprocess.run(["pkill", "-KILL", "-f", "enshrouded_server.exe"],
                            capture_output=True)
@@ -1311,7 +1409,15 @@ class MainWindow(QMainWindow):
         pid = self._process.processId()
         if pid > 0:
             if sys.platform == "win32":
-                self._process.terminate()
+                # The server is a console-subsystem app with no top-level window,
+                # so taskkill /PID (WM_CLOSE) is silently ignored. Send Ctrl+C
+                # via the console API so the server can save before exiting.
+                if not _send_ctrl_c_windows(pid):
+                    self._log.append_info(
+                        "Could not attach to server console — falling back to taskkill.")
+                    subprocess.run(["taskkill", "/PID", str(pid)],
+                                   capture_output=True, stdin=subprocess.DEVNULL,
+                                   check=False)
             else:
                 import signal as _signal
                 try:
@@ -1322,18 +1428,18 @@ class MainWindow(QMainWindow):
 
     def _force_kill(self):
         if self._is_running():
-            self._log.append_error("Server did not stop gracefully — forcing kill.")
+            self._log.append_info("Server did not exit in time — terminating.")
             self._process.kill()
 
     def stop_with_countdown(self):
-        self._stop_countdown_n = FORCE_KILL_SECS
+        self._stop_countdown_n = STOP_COUNTDOWN_SECS
         self._stop_tick()
 
     def restart_server(self):
         self._log.append_info("Restarting server…")
         self._process.finished.connect(
             self._restart_after_stop, Qt.ConnectionType.SingleShotConnection)
-        self._stop_countdown_n = FORCE_KILL_SECS
+        self._stop_countdown_n = STOP_COUNTDOWN_SECS
         self._stop_tick()
 
     def _stop_tick(self):
@@ -1370,12 +1476,16 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_tray"):
             self._tray.setIcon(make_icon(True))
             self._tray.setToolTip("Enshrouded — Running ✔")
-        # During first-run the log is still in the server's relative log dir.
-        if self._overlay and _needs_first_run_migration() and CONFIG_FILE.exists():
-            log_str = json.loads(CONFIG_FILE.read_text()).get("logDirectory", "./logs")
-            server_log = (SERVER_DIR / log_str).resolve() / "enshrouded_server.log"
+        # During first-run the server writes logs to SERVER_DIR/logs/ before config exists.
+        if self._overlay and _needs_first_run_migration():
+            if CONFIG_FILE.exists():
+                log_str = json.loads(CONFIG_FILE.read_text()).get("logDirectory", "./logs")
+                server_log = (SERVER_DIR / log_str).resolve() / "enshrouded_server.log"
+            else:
+                server_log = SERVER_DIR / "logs" / "enshrouded_server.log"
         else:
             server_log = LOG_DIR / "enshrouded_server.log"
+        self._active_log_path = server_log
         self._log_tail_pos = server_log.stat().st_size if server_log.exists() else 0
         self._log_tail_timer.start()
         if self._overlay and _needs_first_run_migration():
@@ -1396,7 +1506,11 @@ class MainWindow(QMainWindow):
         self._tail_server_log()
         code = self._process.exitCode()
         status = self._process.exitStatus()
-        self._log.append_info(f"Server stopped. Exit code: {code}, status: {status}")
+        _QT_FORCE_KILL_CODE = 0xf291
+        if status == QProcess.ExitStatus.CrashExit and code == _QT_FORCE_KILL_CODE:
+            self._log.append_info("Server stopped.")
+        else:
+            self._log.append_info(f"Server stopped (exit code {code}).")
         self._server_tab.set_running(False)
         if hasattr(self, "_tray"):
             self._tray.setIcon(make_icon(False))
@@ -1409,10 +1523,12 @@ class MainWindow(QMainWindow):
                 code = self._process.exitCode()
                 self._overlay.set_status(
                     f"The server stopped (exit code {code}) before generating a world.\n\n"
-                    "Common cause: port 15637 is already in use by a previous server process.\n\n"
-                    "Check the Logs tab for details, resolve the issue, then click Start Server. "
-                    "Or click Skip Setup to dismiss this screen."
+                    "Check the Logs tab for the server's output — it will show the exact error.\n\n"
+                    "Common causes: missing Visual C++ Redistributable 2022 x64, "
+                    "port 15636/15637 already in use, or antivirus blocking the server binary.\n\n"
+                    "Resolve the issue, then click Start Server, or click Skip Setup to dismiss."
                 )
+                self._overlay.show_log_button()
                 self._overlay.show_skip_button()
 
         if self._migration_pending:
@@ -1425,7 +1541,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(1500, self._restart_manager)
 
     def _tail_server_log(self):
-        server_log = LOG_DIR / "enshrouded_server.log"
+        server_log = self._active_log_path
         if not server_log.exists():
             return
         try:
@@ -1701,10 +1817,12 @@ class MainWindow(QMainWindow):
             if self._overlay:
                 self._overlay.set_status("World generated. Stopping server to migrate save files…")
             self._log.append_info("First-run: world generated, stopping server to migrate paths…")
+            pid = self._process.processId()
             if sys.platform == "win32":
-                self._process.terminate()
+                if pid <= 0 or not _send_ctrl_c_windows(pid):
+                    self._process.terminate()
             else:
-                os.kill(self._process.processId(), __import__("signal").SIGINT)
+                os.kill(pid, __import__("signal").SIGINT)
             QTimer.singleShot(15_000, self._force_kill)
         else:
             # Server already stopped — migrate inline now
@@ -1718,6 +1836,8 @@ class MainWindow(QMainWindow):
 
     def _do_first_run_migration(self):
         """Move server-generated saves/logs into managed paths and update config."""
+        if not CONFIG_FILE.exists():
+            return
         data = json.loads(CONFIG_FILE.read_text())
         save_str = data.get("saveDirectory", "")
         log_str  = data.get("logDirectory",  "")
@@ -1726,18 +1846,45 @@ class MainWindow(QMainWindow):
         world_1.mkdir(parents=True, exist_ok=True)
         LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+        moved_saves = 0
         if save_str:
-            src = (SERVER_DIR / save_str).resolve()
+            _sd = Path(save_str)
+            src = (_sd if _sd.is_absolute() else (SERVER_DIR / _sd)).resolve()
             if src.exists() and src != world_1:
                 for item in src.iterdir():
                     shutil.move(str(item), str(world_1 / item.name))
+                    moved_saves += 1
                 try:
                     src.rmdir()
                 except OSError:
                     pass
 
+        # Fallback: if primary path found nothing, scan SERVER_DIR subdirs for save files.
+        if moved_saves == 0:
+            for sub in SERVER_DIR.iterdir():
+                if not sub.is_dir() or sub == world_1:
+                    continue
+                has_index = any(
+                    f.name.endswith("-index") and f.is_file()
+                    for f in sub.iterdir()
+                )
+                if has_index:
+                    self._log.append_info(
+                        f"First-run migration: save files found in {sub.name}/ (not in config path). Moving.")
+                    for item in sub.iterdir():
+                        shutil.move(str(item), str(world_1 / item.name))
+                        moved_saves += 1
+                    try:
+                        sub.rmdir()
+                    except OSError:
+                        pass
+                    break
+
+        self._log.append_info(f"First-run migration: moved {moved_saves} save file(s) to world_1.")
+
         if log_str:
-            src_log = (SERVER_DIR / log_str).resolve()
+            _ld = Path(log_str)
+            src_log = (_ld if _ld.is_absolute() else (SERVER_DIR / _ld)).resolve()
             if src_log.exists() and src_log != LOG_DIR:
                 for item in src_log.iterdir():
                     shutil.move(str(item), str(LOG_DIR / item.name))
@@ -1780,21 +1927,65 @@ class MainWindow(QMainWindow):
         if not self._overlay or self._migration_pending or not self._is_running():
             return
         self._overlay.set_status(
-            "The server is running and generating your world.\n\n"
-            "When you're ready, click 'Complete Setup Now' to stop the server "
-            "and finish the first-time setup. The manager will restart automatically."
+            "The server is generating your world.\n\n"
+            "This typically takes about 5 minutes — Enshrouded writes its first save to "
+            "disk on the 5-minute periodic save tick. Setup completes automatically once "
+            "that save is on disk; you can also click 'Complete Setup Now' below and the "
+            "manager will wait for the save before finishing."
         )
         self._overlay.show_complete_button()
 
     def _complete_first_run_setup(self):
         """Called when the user clicks 'Complete Setup Now' on the overlay."""
+        # Stopping the server before it has written its first periodic save
+        # would leave server/savegame/ empty, so migration would move nothing
+        # and world_1 would be empty on next launch. Wait for the save first.
+        save_exists = False
+        if CONFIG_FILE.exists():
+            try:
+                data = json.loads(CONFIG_FILE.read_text())
+                save_str = data.get("saveDirectory", "")
+                if save_str and not Path(save_str).is_absolute():
+                    save_path = (SERVER_DIR / save_str).resolve()
+                    save_exists = save_path.exists() and any(save_path.iterdir())
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        if self._is_running() and not save_exists:
+            if self._overlay:
+                self._overlay.set_status(
+                    "The server hasn't written the first world save yet.\n\n"
+                    "Enshrouded saves every 5 minutes after world generation begins.\n"
+                    "Setup will complete automatically once that first save is on disk."
+                )
+            if not self._migration_timer.isActive():
+                self._migration_timer.start()
+            return
+
         if self._overlay:
             self._overlay.hide_buttons()
             self._overlay.set_status("Stopping server to complete setup…")
         if self._is_running():
+            self._migration_pending = True  # guarantee migration runs after stop
             self.stop_server()
+        elif CONFIG_FILE.exists():
+            if self._overlay:
+                self._overlay.set_status("Migrating save files… Restarting manager.")
+            self._log.append_info("First-run setup: migrating save files…")
+            self._do_first_run_migration()
+            self._log.append_info("Migration complete. Restarting manager…")
+            QTimer.singleShot(1500, self._restart_manager)
         else:
-            self._check_first_run_migration()
+            self._dismiss_overlay()
+
+    def _open_first_run_log(self):
+        if self._active_log_path.exists():
+            subprocess.Popen(["notepad", str(self._active_log_path)])
+        else:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Log Not Found",
+                f"No log file found yet at:\n{self._active_log_path}\n\n"
+                "The server may have crashed before writing any output.")
 
     def _dismiss_overlay(self):
         if self._overlay:
@@ -1826,11 +2017,30 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 def main():
+    # pythonw.exe discards stdout/stderr, so an uncaught exception from a Qt
+    # slot vanishes silently and the process disappears. Log to a file instead.
+    import traceback
+    _error_log = Path(__file__).parent / "manager_error.log"
+    def _excepthook(exc_type, exc_value, exc_tb):
+        try:
+            with open(_error_log, "a", encoding="utf-8") as f:
+                f.write(f"\n=== {datetime.now().isoformat()} ===\n")
+                traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
+        except OSError:
+            pass
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    sys.excepthook = _excepthook
+
     migrate_saves_if_needed()
     migrate_world_configs_if_needed()
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    _icon_path = Path(__file__).parent / "manager.ico"
+    if _icon_path.exists():
+        app.setWindowIcon(QIcon(str(_icon_path)))
+    elif SERVER_BIN.exists():
+        app.setWindowIcon(QIcon(str(SERVER_BIN)))
 
     # Single-instance lock — held for the lifetime of the process.
     global _lock_fh

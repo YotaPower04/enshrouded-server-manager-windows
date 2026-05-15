@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Installer artifacts
+install.json
+launch.bat
+server/
+saves/
+steamcmd/
+*.zip
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# Local-only (Claude / dev notes, never push)
+.claude/
+CLAUDE.md
+assets/*_preview.png
