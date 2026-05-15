@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox,
     QGroupBox, QFormLayout, QScrollArea,
     QMessageBox, QListWidget, QListWidgetItem,
-    QInputDialog, QTimeEdit, QFileDialog,
+    QInputDialog, QTimeEdit, QFileDialog, QProgressBar,
 )
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QBrush, QPen, QFont
 from PyQt6.QtCore import Qt, QTime, QTimer, QProcess, QProcessEnvironment, pyqtSignal
@@ -78,6 +78,103 @@ MACHINE_RE      = re.compile(
 STOP_COUNTDOWN_SECS = 5   # visible countdown before sending stop signal
 FORCE_KILL_SECS     = 30  # grace period before force-killing if server won't stop
 SETTINGS_FILE   = Path(__file__).parent / "manager_settings.json"
+
+# ---------------------------------------------------------------------------
+# Theme — dark-navy palette shared with the installer (src/install_tk.py)
+# ---------------------------------------------------------------------------
+THEME_BG    = "#0f0f1a"   # window background
+THEME_HDR   = "#1a1a2e"   # panels, tab bar, borders
+THEME_ACC   = "#00d4ff"   # cyan accent (titles, selected tab, focus)
+THEME_TXT   = "#e8e8e8"   # primary text
+THEME_DIM   = "#888888"   # dim / secondary text
+THEME_BTN   = "#1e3a5f"   # default button
+THEME_HOVR  = "#2a5080"   # button hover / selection
+THEME_FIELD = "#12121e"   # input field background
+THEME_LOG   = "#070710"   # log / console background
+
+APP_STYLESHEET = f"""
+QWidget {{ background-color: {THEME_BG}; color: {THEME_TXT}; font-size: 13px; }}
+QMainWindow, QDialog {{ background-color: {THEME_BG}; }}
+
+QTabWidget::pane {{ border: 1px solid {THEME_HDR}; background: {THEME_BG}; }}
+QTabBar::tab {{
+    background: {THEME_HDR}; color: {THEME_DIM};
+    padding: 8px 16px; margin-right: 2px;
+    border-top-left-radius: 4px; border-top-right-radius: 4px;
+}}
+QTabBar::tab:selected {{ background: {THEME_BG}; color: {THEME_ACC}; }}
+QTabBar::tab:hover {{ color: {THEME_TXT}; }}
+
+QPushButton {{
+    background: {THEME_BTN}; color: {THEME_TXT};
+    border: none; border-radius: 4px; padding: 6px 14px;
+}}
+QPushButton:hover {{ background: {THEME_HOVR}; }}
+QPushButton:disabled {{ background: {THEME_HDR}; color: #555555; }}
+
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTimeEdit {{
+    background: {THEME_FIELD}; color: {THEME_TXT};
+    border: 1px solid {THEME_HDR}; border-radius: 4px; padding: 4px;
+    selection-background-color: {THEME_HOVR};
+}}
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+QComboBox:focus, QTimeEdit:focus {{ border: 1px solid {THEME_ACC}; }}
+QComboBox QAbstractItemView {{
+    background: {THEME_FIELD}; color: {THEME_TXT};
+    selection-background-color: {THEME_HOVR};
+}}
+QTextEdit {{
+    background: {THEME_LOG}; color: {THEME_TXT};
+    border: 1px solid {THEME_HDR}; border-radius: 4px;
+    selection-background-color: {THEME_HOVR};
+}}
+
+QGroupBox {{
+    border: 1px solid {THEME_HDR}; border-radius: 6px;
+    margin-top: 12px; padding-top: 8px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin; subcontrol-position: top left;
+    left: 10px; padding: 0 4px; color: {THEME_ACC};
+}}
+
+QListWidget {{
+    background: {THEME_FIELD}; color: {THEME_TXT};
+    border: 1px solid {THEME_HDR}; border-radius: 4px;
+}}
+QListWidget::item:selected {{ background: {THEME_HOVR}; color: #ffffff; }}
+
+QCheckBox {{ background: transparent; }}
+QCheckBox::indicator {{
+    width: 16px; height: 16px;
+    border: 1px solid {THEME_HOVR}; border-radius: 3px; background: {THEME_FIELD};
+}}
+QCheckBox::indicator:checked {{ background: {THEME_ACC}; border: 1px solid {THEME_ACC}; }}
+
+QScrollArea {{ border: none; }}
+QScrollBar:vertical {{ background: {THEME_BG}; width: 12px; margin: 0; }}
+QScrollBar::handle:vertical {{
+    background: {THEME_BTN}; border-radius: 6px; min-height: 24px;
+}}
+QScrollBar::handle:vertical:hover {{ background: {THEME_HOVR}; }}
+QScrollBar:horizontal {{ background: {THEME_BG}; height: 12px; }}
+QScrollBar::handle:horizontal {{
+    background: {THEME_BTN}; border-radius: 6px; min-width: 24px;
+}}
+QScrollBar::handle:horizontal:hover {{ background: {THEME_HOVR}; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
+
+QMenu {{ background: {THEME_HDR}; color: {THEME_TXT}; border: 1px solid {THEME_HOVR}; }}
+QMenu::item:selected {{ background: {THEME_HOVR}; }}
+
+QProgressBar {{
+    background: {THEME_FIELD}; border: none; border-radius: 4px;
+    text-align: center; color: {THEME_TXT};
+}}
+QProgressBar::chunk {{ background: {THEME_ACC}; border-radius: 4px; }}
+
+QToolTip {{ background: {THEME_HDR}; color: {THEME_TXT}; border: 1px solid {THEME_HOVR}; }}
+"""
 
 # ---------------------------------------------------------------------------
 # PE subsystem patch — suppress Wine console window for headless server
@@ -240,12 +337,16 @@ def _needs_first_run_migration() -> bool:
 class FirstRunOverlay(QWidget):
     """Full-window overlay shown during first-run setup. Blocks all tab interaction."""
     skip_requested     = pyqtSignal()
-    complete_requested = pyqtSignal()
+    restart_requested  = pyqtSignal()
     open_log_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget):
         super().__init__(parent)
-        self.setStyleSheet("background: #111111;")
+        # A plain QWidget ignores a stylesheet background unless this is set —
+        # without it the overlay paints nothing and the tabs show through.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAutoFillBackground(True)
+        self.setStyleSheet(f"FirstRunOverlay {{ background: {THEME_BG}; }}")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(80, 60, 80, 60)
@@ -253,31 +354,46 @@ class FirstRunOverlay(QWidget):
         layout.addStretch()
 
         title = QLabel("First-Time Setup")
-        title.setStyleSheet("color: #ffffff; font-size: 22px; font-weight: bold; background: transparent;")
+        title.setStyleSheet(
+            f"color: {THEME_ACC}; font-size: 22px; font-weight: bold; background: transparent;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self._status = QLabel("Starting server…")
-        self._status.setStyleSheet("color: #aaaaaa; font-size: 14px; background: transparent;")
+        self._status.setStyleSheet(
+            f"color: {THEME_TXT}; font-size: 15px; font-weight: bold; background: transparent;")
         self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._status.setWordWrap(True)
 
+        # Indeterminate busy bar — shown while first-run setup is in progress.
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 0)          # range 0..0 = animated indeterminate
+        self._progress.setTextVisible(False)
+        self._progress.setFixedHeight(8)
+        self._progress.setMaximumWidth(320)
+        self._progress.setStyleSheet(
+            f"QProgressBar {{ background:{THEME_FIELD}; border:none; border-radius:4px; }}"
+            f"QProgressBar::chunk {{ background:{THEME_ACC}; border-radius:4px; }}"
+        )
+
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        self._complete_btn = QPushButton("Complete Setup Now")
-        self._complete_btn.setVisible(False)
-        self._complete_btn.setMinimumHeight(36)
-        self._complete_btn.setStyleSheet(
+        # Shown only once setup is fully finished — confirms the user is ready
+        # for the manager to restart.
+        self._restart_btn = QPushButton("Setup Complete — Restart Manager")
+        self._restart_btn.setVisible(False)
+        self._restart_btn.setMinimumHeight(36)
+        self._restart_btn.setStyleSheet(
             "QPushButton { background:#27ae60; color:white; border-radius:4px; padding:6px 16px; }"
             "QPushButton:hover { background:#2ecc71; }"
         )
-        self._complete_btn.clicked.connect(self.complete_requested)
+        self._restart_btn.clicked.connect(self.restart_requested)
 
         self._skip_btn = QPushButton("Skip Setup")
         self._skip_btn.setVisible(False)
         self._skip_btn.setMinimumHeight(36)
         self._skip_btn.setStyleSheet(
-            "QPushButton { background:#555; color:white; border-radius:4px; padding:6px 12px; }"
-            "QPushButton:hover { background:#888; }"
+            f"QPushButton {{ background:{THEME_BTN}; color:{THEME_TXT}; border-radius:4px; padding:6px 12px; }}"
+            f"QPushButton:hover {{ background:{THEME_HOVR}; }}"
         )
         self._skip_btn.clicked.connect(self.skip_requested)
 
@@ -285,12 +401,12 @@ class FirstRunOverlay(QWidget):
         self._log_btn.setVisible(False)
         self._log_btn.setMinimumHeight(36)
         self._log_btn.setStyleSheet(
-            "QPushButton { background:#2980b9; color:white; border-radius:4px; padding:6px 12px; }"
-            "QPushButton:hover { background:#3498db; }"
+            f"QPushButton {{ background:{THEME_BTN}; color:{THEME_TXT}; border-radius:4px; padding:6px 12px; }}"
+            f"QPushButton:hover {{ background:{THEME_HOVR}; }}"
         )
         self._log_btn.clicked.connect(self.open_log_requested)
 
-        btn_row.addWidget(self._complete_btn)
+        btn_row.addWidget(self._restart_btn)
         btn_row.addWidget(self._log_btn)
         btn_row.addWidget(self._skip_btn)
         btn_row.addStretch()
@@ -299,14 +415,22 @@ class FirstRunOverlay(QWidget):
         layout.addSpacing(8)
         layout.addWidget(self._status)
         layout.addSpacing(16)
+        layout.addWidget(self._progress, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addSpacing(16)
         layout.addLayout(btn_row)
         layout.addStretch()
 
     def set_status(self, text: str):
         self._status.setText(text)
 
-    def show_complete_button(self):
-        self._complete_btn.setVisible(True)
+    def hide_progress(self):
+        self._progress.setVisible(False)
+
+    def setup_finished(self, text: str):
+        """First-run setup is fully done — stop the busy bar and offer the restart."""
+        self._status.setText(text)
+        self._progress.setVisible(False)
+        self._restart_btn.setVisible(True)
 
     def show_skip_button(self):
         self._skip_btn.setVisible(True)
@@ -315,7 +439,7 @@ class FirstRunOverlay(QWidget):
         self._log_btn.setVisible(True)
 
     def hide_buttons(self):
-        self._complete_btn.setVisible(False)
+        self._restart_btn.setVisible(False)
         self._skip_btn.setVisible(False)
         self._log_btn.setVisible(False)
 
@@ -1230,6 +1354,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Enshrouded Server Manager")
+        _win_icon = Path(__file__).parent / "manager.ico"
+        if _win_icon.exists():
+            self.setWindowIcon(QIcon(str(_win_icon)))
         self.resize(860, 660)
 
         self._process = QProcess(self)
@@ -1318,7 +1445,7 @@ class MainWindow(QMainWindow):
         if _needs_first_run_migration():
             self._overlay = FirstRunOverlay(self)
             self._overlay.skip_requested.connect(self._dismiss_overlay)
-            self._overlay.complete_requested.connect(self._complete_first_run_setup)
+            self._overlay.restart_requested.connect(self._restart_manager)
             self._overlay.open_log_requested.connect(self._open_first_run_log)
             self._overlay.setGeometry(0, 0, self.width(), self.height())
             self._overlay.show()
@@ -1495,8 +1622,6 @@ class MainWindow(QMainWindow):
             )
             self._migration_timer.start()
             self._check_first_run_migration()  # immediate check in case files exist from a prior run
-            # After 30 s of stable running, tell the user they can stop the server.
-            QTimer.singleShot(30_000, self._on_first_run_server_stable)
 
     def _on_server_stopped(self):
         self._log_tail_timer.stop()
@@ -1528,17 +1653,13 @@ class MainWindow(QMainWindow):
                     "port 15636/15637 already in use, or antivirus blocking the server binary.\n\n"
                     "Resolve the issue, then click Start Server, or click Skip Setup to dismiss."
                 )
+                self._overlay.hide_progress()
                 self._overlay.show_log_button()
                 self._overlay.show_skip_button()
 
         if self._migration_pending:
             self._migration_pending = False
-            if self._overlay:
-                self._overlay.set_status("Migrating save files… Restarting manager.")
-            self._log.append_info("First-run setup: migrating save files…")
-            self._do_first_run_migration()
-            self._log.append_info("Migration complete. Restarting manager…")
-            QTimer.singleShot(1500, self._restart_manager)
+            self._finish_first_run_setup()
 
     def _tail_server_log(self):
         server_log = self._active_log_path
@@ -1826,13 +1947,19 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(15_000, self._force_kill)
         else:
             # Server already stopped — migrate inline now
-            if self._overlay:
-                self._overlay.set_status("Migrating save files… Restarting manager.")
-            self._log.append_info("First-run: migrating save files…")
-            self._do_first_run_migration()
-            self._log.append_info("Migration complete. Restarting manager…")
-            QTimer.singleShot(1500, self._restart_manager)
+            self._finish_first_run_setup()
         return True
+
+    def _finish_first_run_setup(self):
+        """Run the save migration, then wait for the user to confirm the restart."""
+        self._log.append_info("First-run setup: migrating save files…")
+        self._do_first_run_migration()
+        self._log.append_info("Migration complete. Waiting for user to confirm restart.")
+        if self._overlay:
+            self._overlay.setup_finished(
+                "Setup is complete — your world has been migrated into the manager.\n\n"
+                "The manager needs to restart to load it. Click below when you're ready."
+            )
 
     def _do_first_run_migration(self):
         """Move server-generated saves/logs into managed paths and update config."""
@@ -1922,62 +2049,6 @@ class MainWindow(QMainWindow):
             subprocess.Popen([sys.executable, str(Path(__file__).resolve())])
         QApplication.quit()
 
-    def _on_first_run_server_stable(self):
-        """Fires 30 s after first-run server start; server is likely ready for setup."""
-        if not self._overlay or self._migration_pending or not self._is_running():
-            return
-        self._overlay.set_status(
-            "The server is generating your world.\n\n"
-            "This typically takes about 5 minutes — Enshrouded writes its first save to "
-            "disk on the 5-minute periodic save tick. Setup completes automatically once "
-            "that save is on disk; you can also click 'Complete Setup Now' below and the "
-            "manager will wait for the save before finishing."
-        )
-        self._overlay.show_complete_button()
-
-    def _complete_first_run_setup(self):
-        """Called when the user clicks 'Complete Setup Now' on the overlay."""
-        # Stopping the server before it has written its first periodic save
-        # would leave server/savegame/ empty, so migration would move nothing
-        # and world_1 would be empty on next launch. Wait for the save first.
-        save_exists = False
-        if CONFIG_FILE.exists():
-            try:
-                data = json.loads(CONFIG_FILE.read_text())
-                save_str = data.get("saveDirectory", "")
-                if save_str and not Path(save_str).is_absolute():
-                    save_path = (SERVER_DIR / save_str).resolve()
-                    save_exists = save_path.exists() and any(save_path.iterdir())
-            except (OSError, json.JSONDecodeError):
-                pass
-
-        if self._is_running() and not save_exists:
-            if self._overlay:
-                self._overlay.set_status(
-                    "The server hasn't written the first world save yet.\n\n"
-                    "Enshrouded saves every 5 minutes after world generation begins.\n"
-                    "Setup will complete automatically once that first save is on disk."
-                )
-            if not self._migration_timer.isActive():
-                self._migration_timer.start()
-            return
-
-        if self._overlay:
-            self._overlay.hide_buttons()
-            self._overlay.set_status("Stopping server to complete setup…")
-        if self._is_running():
-            self._migration_pending = True  # guarantee migration runs after stop
-            self.stop_server()
-        elif CONFIG_FILE.exists():
-            if self._overlay:
-                self._overlay.set_status("Migrating save files… Restarting manager.")
-            self._log.append_info("First-run setup: migrating save files…")
-            self._do_first_run_migration()
-            self._log.append_info("Migration complete. Restarting manager…")
-            QTimer.singleShot(1500, self._restart_manager)
-        else:
-            self._dismiss_overlay()
-
     def _open_first_run_log(self):
         if self._active_log_path.exists():
             subprocess.Popen(["notepad", str(self._active_log_path)])
@@ -2034,7 +2105,20 @@ def main():
     migrate_saves_if_needed()
     migrate_world_configs_if_needed()
 
+    # Windows groups the taskbar button (and its icon) by AppUserModelID.
+    # Without an explicit ID, Windows uses the host process — pythonw.exe —
+    # so the taskbar shows the Python icon. Declaring our own ID makes Windows
+    # treat the app as distinct and use the window icon instead.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "YotaPower04.EnshroudedServerManager")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+    app.setStyleSheet(APP_STYLESHEET)
     app.setQuitOnLastWindowClosed(False)
     _icon_path = Path(__file__).parent / "manager.ico"
     if _icon_path.exists():

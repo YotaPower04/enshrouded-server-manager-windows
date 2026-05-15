@@ -24,18 +24,18 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Building Install.exe...
+echo Building "Install ESM.exe"...
 pyinstaller --noconfirm --onefile --windowed --icon=assets\install.ico ^
     --add-data "src\enshrouded_manager.py;." ^
     --add-data "assets\manager.ico;." ^
     --add-data "assets\running.ico;." ^
-    --name "Install" src\install_tk.py
+    --name "Install ESM" src\install_tk.py
 
-if exist dist\Install.exe (
+if exist "dist\Install ESM.exe" (
     echo.
     echo [OK] Built successfully.
-    copy /y dist\Install.exe Install.exe >nul
-    echo [OK] Copied to Install.exe -- ready to distribute.
+    copy /y "dist\Install ESM.exe" "Install ESM.exe" >nul
+    echo [OK] Copied to "Install ESM.exe" -- ready to distribute.
 ) else (
     echo.
     echo [ERR] Build failed -- check PyInstaller output above.
