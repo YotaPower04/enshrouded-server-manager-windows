@@ -96,7 +96,7 @@ THEME_TXT   = "#e8e8e8"   # primary text
 THEME_DIM   = "#888888"   # dim / secondary text
 THEME_BTN   = "#1e3a5f"   # default button
 THEME_HOVR  = "#2a5080"   # button hover / selection
-THEME_FIELD = "#12121e"   # input field background
+THEME_FIELD = "#2a2a3f"   # input field background — a few shades above the panels
 THEME_LOG   = "#070710"   # log / console background
 
 APP_STYLESHEET = f"""
@@ -149,7 +149,8 @@ QListWidget {{
     background: {THEME_FIELD}; color: {THEME_TXT};
     border: 1px solid {THEME_HDR}; border-radius: 4px;
 }}
-QListWidget::item:selected {{ background: {THEME_HOVR}; color: #ffffff; }}
+QListWidget::item:selected,
+QListWidget::item:selected:!active {{ background: {THEME_HOVR}; color: #ffffff; }}
 
 QCheckBox {{ background: transparent; }}
 QCheckBox::indicator {{
